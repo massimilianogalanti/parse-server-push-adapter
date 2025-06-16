@@ -48,7 +48,7 @@ export default class ParsePushAdapter {
         break;
       case 'android':
       case 'fcm':
-        if (pushConfig[pushType].hasOwnProperty('firebaseServiceAccount')) {
+        if (pushConfig[pushType].hasOwnProperty('firebaseServiceAccount') || Array.isArray(pushConfig[pushType])) {
           this.senderMap[pushType] = new FCM(pushConfig[pushType], 'android');
         } else {
           this.senderMap[pushType] = new GCM(pushConfig[pushType]);
