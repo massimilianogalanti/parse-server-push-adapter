@@ -17,35 +17,38 @@ const apnsIntegerDataKeys = [
   'expiration_time',
 ];
 
-export default function FCM(args, pushType) {
-  if (typeof args !== 'object' || !args.firebaseServiceAccount) {
+export default function FCM(list, pushType) {
+  if (typeof list !== 'object' && !Array.isArray(list)) {
     throw new Parse.Error(
       Parse.Error.PUSH_MISCONFIGURED,
       'FCM Configuration is invalid',
     );
   }
 
-  const fcmEnableLegacyHttpTransport = typeof args.fcmEnableLegacyHttpTransport === 'boolean'
-    ? args.fcmEnableLegacyHttpTransport
-    : false;
-  this.resolveUnhandledClientError = typeof args.resolveUnhandledClientError === 'boolean'
-    ? args.resolveUnhandledClientError
-    : false;
+  this.sender = {};
 
-  let app;
-  if (getApps().length === 0) {
-    app = initializeApp({ credential: cert(args.firebaseServiceAccount) });
-  } else {
-    app = getApp();
+  if (!Array.isArray(list)) list = [list];
+
+  // iterate
+  for (const args of list) {
+    const fcmEnableLegacyHttpTransport = typeof args.fcmEnableLegacyHttpTransport === 'boolean'
+      ? args.fcmEnableLegacyHttpTransport
+      : false;
+    this.resolveUnhandledClientError = typeof args.resolveUnhandledClientError === 'boolean'
+      ? args.resolveUnhandledClientError
+      : false;
+
+    const appIdentifier = args.topic;
+
+    initializeApp({ credential: cert(args.firebaseServiceAccount) }, appIdentifier);
+
+    this.sender[appIdentifier] = getMessaging(app);
+
+    if (fcmEnableLegacyHttpTransport) {
+      this.sender[appIdentifier].enableLegacyHttpTransport();
+      log.warn(LOG_PREFIX, 'Legacy HTTP/1.1 transport is enabled. This is a deprecated feature and support for this flag will be removed in the future.');
+    }
   }
-
-  this.sender = getMessaging(app);
-
-  if (fcmEnableLegacyHttpTransport) {
-    this.sender.enableLegacyHttpTransport();
-    log.warn(LOG_PREFIX, 'Legacy HTTP/1.1 transport is enabled. This is a deprecated feature and support for this flag will be removed in the future.');
-  }
-
   // Push type is only used to remain backwards compatible with APNS and GCM
   this.pushType = pushType;
 }
@@ -75,80 +78,87 @@ FCM.prototype.send = function (data, devices) {
 
     // Build a device map
     const devicesMap = deviceSlice.reduce((memo, device) => {
-      memo[device.deviceToken] = device;
+      if (!memo[device.appIdentifier]) memo[device.appIdentifier] = {};
+      memo[device.appIdentifier][device.deviceToken] = device;
       return memo;
     }, {});
 
-    const deviceTokens = Object.keys(devicesMap);
+    const appIdentifiers = Object.keys(devicesMap);
 
-    const fcmPayload = generateFCMPayload(
-      data,
-      pushId,
-      timestamp,
-      deviceTokens,
-      pushType,
-    );
-    const length = deviceTokens.length;
-    log.info(LOG_PREFIX, `sending push to ${length} devices`);
+    let subPromises = [];
+    for (const appIdentifier of appIdentifiers) {
+      const deviceTokens = Object.keys(devicesMap[appIdentifier]);
 
-    // This is a safe wrapper for sendEachForMulticast, due to bug in the firebase-admin
-    // library, where it throws an exception instead of returning a rejected promise
-    const sendEachForMulticastSafe = fcmPayloadData => {
-      try {
-        return this.sender.sendEachForMulticast(fcmPayloadData);
-      } catch (err) {
-        log.error(LOG_PREFIX, `error sending push: firebase client exception: ${err}`);
-        return Promise.reject(new Parse.Error(Parse.Error.OTHER_CAUSE, err));
-      }
-    };
+      const fcmPayload = generateFCMPayload(
+        data,
+        pushId,
+        timestamp,
+        deviceTokens,
+        pushType,
+      );
+      const length = deviceTokens.length;
+      log.info(LOG_PREFIX, `sending push to ${length} devices for appIdentifier ${appIdentifier}`);
 
-    return sendEachForMulticastSafe(fcmPayload.data)
-      .then((response) => {
-        const promises = [];
-        const failedTokens = [];
-        const successfulTokens = [];
+      // This is a safe wrapper for sendEachForMulticast, due to bug in the firebase-admin
+      // library, where it throws an exception instead of returning a rejected promise
+      const sendEachForMulticastSafe = fcmPayloadData => {
+        try {
+          return this.sender[appIdentifier].sendEachForMulticast(fcmPayloadData);
+        } catch (err) {
+          log.error(LOG_PREFIX, `error sending push: firebase client exception: ${err}`);
+          return Promise.reject(new Parse.Error(Parse.Error.OTHER_CAUSE, err));
+        }
+      };
 
-        response.responses.forEach((resp, idx) => {
-          if (resp.success) {
-            successfulTokens.push(deviceTokens[idx]);
-            promises.push(
-              createSuccessfulPromise(
-                deviceTokens[idx],
-                devicesMap[deviceTokens[idx]].deviceType,
-              ),
-            );
-          } else {
-            failedTokens.push(deviceTokens[idx]);
-            promises.push(
-              createErrorPromise(
-                deviceTokens[idx],
-                devicesMap[deviceTokens[idx]].deviceType,
-                resp.error,
-              ),
-            );
+      subPromises.push(sendEachForMulticastSafe(fcmPayload.data)
+        .then((response) => {
+          const promises = [];
+          const failedTokens = [];
+          const successfulTokens = [];
+
+          response.responses.forEach((resp, idx) => {
+            if (resp.success) {
+              successfulTokens.push(deviceTokens[idx]);
+              promises.push(
+                createSuccessfulPromise(
+                  deviceTokens[idx],
+                  devicesMap[deviceTokens[idx]].deviceType,
+                ),
+              );
+            } else {
+              failedTokens.push(deviceTokens[idx]);
+              promises.push(
+                createErrorPromise(
+                  deviceTokens[idx],
+                  devicesMap[deviceTokens[idx]].deviceType,
+                  resp.error,
+                ),
+              );
+              log.error(
+                LOG_PREFIX,
+                `failed to send to ${deviceTokens[idx]} with error: ${JSON.stringify(resp.error)}`,
+              );
+            }
+          });
+
+          if (failedTokens.length) {
             log.error(
               LOG_PREFIX,
-              `failed to send to ${deviceTokens[idx]} with error: ${JSON.stringify(resp.error)}`,
+              `tokens with failed pushes: ${JSON.stringify(failedTokens)}`,
             );
           }
-        });
 
-        if (failedTokens.length) {
-          log.error(
-            LOG_PREFIX,
-            `tokens with failed pushes: ${JSON.stringify(failedTokens)}`,
-          );
-        }
+          if (successfulTokens.length) {
+            log.verbose(
+              LOG_PREFIX,
+              `tokens with successful pushes: ${JSON.stringify(successfulTokens)}`,
+            );
+          }
 
-        if (successfulTokens.length) {
-          log.verbose(
-            LOG_PREFIX,
-            `tokens with successful pushes: ${JSON.stringify(successfulTokens)}`,
-          );
-        }
-
-        return Promise.all(promises);
-      });
+          return Promise.all(promises);
+        }));
+    }
+    return subPromises;
   };
 
   const allPromises = Promise.all(
